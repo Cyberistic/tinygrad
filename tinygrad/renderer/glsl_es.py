@@ -346,6 +346,24 @@ class GLSLESRenderer(CStyleLanguage):
     # Pad to 3 dims for GLSL ES
     while len(local_size) < 3: local_size.append(1)
 
+    # Workaround for Samsung Xclipse 540 GLES 3.1 driver bug: gl_LocalInvocationID.z
+    # threads don't fully execute (or behave incorrectly), causing 3D-dispatched
+    # kernels to produce wrong results. Flatten the local z dimension into
+    # local x: set local_size_z = 1 and multiply local_size_x by the original
+    # z count. Rewrite the kernel body to derive lidx2 and lidx0 from
+    # gl_LocalInvocationID.x using the original local_size_x as the divisor.
+    # The global dispatch dims remain 3D so gidx2 (gl_WorkGroupID.z) still
+    # works. This is a renderer-level fix that only affects the GLSLESRenderer.
+    orig_lx = local_size[0]
+    orig_ly = local_size[1]
+    orig_lz = local_size[2]
+    flatten_local_z = orig_lz > 1
+    if flatten_local_z:
+      local_size[0] = orig_lx * orig_lz
+      local_size[2] = 1
+    else:
+      orig_lx = orig_ly = orig_lz = None
+
     # Detect vector width for each buffer. After linearization, BUFFER
     # UOps become PARAM UOps. The PARAM's arg is a ParamArg object with
     # an `idx` attribute. We walk all UOps to find the max vector width
@@ -558,6 +576,23 @@ class GLSLESRenderer(CStyleLanguage):
           continue
       new_kernel.append(line)
     kernel = new_kernel
+    # If we flattened local z into x (Xclipse 540 workaround), rewrite the
+    # lidx0/lidx2 declarations in the kernel body to compute the original
+    # indices from gl_LocalInvocationID.x.
+    if flatten_local_z:
+      new_kernel = []
+      lidx0_re = re.compile(r"(\s*)int\s+lidx0\s*=\s*int\(gl_LocalInvocationID\.x\);")
+      lidx2_re = re.compile(r"(\s*)int\s+lidx2\s*=\s*int\(gl_LocalInvocationID\.z\);")
+      for line in kernel:
+        m0 = lidx0_re.match(line)
+        m2 = lidx2_re.match(line)
+        if m0:
+          new_kernel.append(f"{m0.group(1)}int lidx0 = int(gl_LocalInvocationID.x) % {orig_lx};")
+        elif m2:
+          new_kernel.append(f"{m2.group(1)}int lidx2 = int(gl_LocalInvocationID.x) / {orig_lx};")
+        else:
+          new_kernel.append(line)
+      kernel = new_kernel
     # Main function
     prg += "void main() {\n"
     prg += "\n".join(kernel)
