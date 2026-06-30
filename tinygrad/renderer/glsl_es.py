@@ -36,20 +36,52 @@ def _glsl_es_float_const(x):
   if math.isnan(x.arg):      return "(0.0/0.0)"
   return None  # let the generic pattern fire
 
+def _find_buffer_uop(u: UOp) -> UOp | None:
+  """Walk through AFTER/SHRINK/PARAM wrappers to find the underlying BUFFER."""
+  seen = set()
+  while u.op not in (Ops.BUFFER, Ops.PARAM) and id(u) not in seen:
+    seen.add(id(u))
+    if not u.src: return None
+    u = u.src[0]
+  return u if u.op is Ops.BUFFER else None
+
+
 def _render_glsl_es_store(ctx, bidx, var) -> str:
   # Find the underlying BUFFER UOp and its declared scalar type.
-  if bidx.op is Ops.INDEX and len(bidx.src) >= 1 and bidx.src[0].op is Ops.BUFFER:
-    buf = bidx.src[0]
+  if bidx.op is Ops.INDEX:
+    buf = _find_buffer_uop(bidx)
   elif bidx.op is Ops.BUFFER:
     buf = bidx
   else:
+    buf = None
+  if buf is None:
     return f"{ctx.render_access(bidx)} = {ctx[var]};"
   rendered = ctx._render_dtype(buf.dtype, 1, buf.arg.addrspace)
-  # If var's rendered type differs from the buffer's declared type, cast.
-  var_rendered = ctx._render_dtype(var.dtype, 1, buf.arg.addrspace)
+  # The value's rendered type is based on its actual dtype (use REG/ALU
+  # addrspace, not the buffer's addrspace, so an int value renders as int).
+  var_rendered = ctx._render_dtype(var.dtype, 1, AddrSpace.REG)
   if rendered != var_rendered:
     return f"{ctx.render_access(bidx)} = {rendered}({ctx[var]});"
   return f"{ctx.render_access(bidx)} = {ctx[var]};"
+
+
+def _render_glsl_es_load(ctx, bidx, load_dtype) -> str:
+  # Find the underlying BUFFER UOp and its declared scalar type.
+  if bidx.op is Ops.INDEX:
+    buf = _find_buffer_uop(bidx)
+  elif bidx.op is Ops.BUFFER:
+    buf = bidx
+  else:
+    buf = None
+  if buf is None:
+    return f"{ctx[bidx]}"
+  rendered = ctx._render_dtype(buf.dtype, 1, buf.arg.addrspace)
+  # The LOAD result's rendered type is based on its actual dtype (use REG
+  # addrspace, not the buffer's addrspace, so an int LOAD renders as int).
+  load_rendered = ctx._render_dtype(load_dtype, 1, AddrSpace.REG)
+  if rendered != load_rendered:
+    return f"{load_rendered}({ctx[bidx]})"
+  return f"{ctx[bidx]}"
 
 
 glsl_es_matcher = PatternMatcher([
@@ -127,8 +159,11 @@ glsl_es_matcher = PatternMatcher([
    lambda ctx,x,b: (f"vec{x.dtype.count}({','.join(f'{ctx[b]}[{i}]' for i in range(x.dtype.count))})"
                        if x.dtype.count > 1 else f"{ctx[b]}[0]")
    if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]})"),
-  # load
-  (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"{ctx[bidx]}"),
+  # load: cast the loaded value to the LOAD's declared dtype if the
+  # buffer's rendered type differs (e.g. LOCAL shared memory is forced
+  # to float; reading an int LOAD from it needs int(float(buf[idx]))).
+  (UPat(Ops.LOAD, src=(UPat.var('bidx'),), name="x"),
+   lambda ctx,x,bidx: _render_glsl_es_load(ctx, bidx, x.dtype)),
   # Gated load (bounds-checked): use a multiply by the gate, which is
   # type-agnostic in GLSL ES. The codegen always uses 0.0f as the
   # default `var` for bounds-checked loads, so `gate ? bidx : 0.0f`
