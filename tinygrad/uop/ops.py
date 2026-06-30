@@ -811,6 +811,11 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op is Ops.MSELECT: return self.src[0].buf_uop.mselect(self.arg)
     if self.op is Ops.MSTACK: return UOp(Ops.MSTACK, self.dtype, src=tuple(x.buf_uop for x in self.src))
     if self.base.op is Ops.AFTER: return self.base.src[0].buf_uop.base
+    # For value-producing ops (REDUCE, STORE), the output is stored in a
+    # separate BUFFER wrapped in AFTER/STAGE. Don't walk into src[0] which
+    # would return the input-side buffer. Instead, return self and let
+    # the caller resolve through AFTER/STAGE.
+    if self.op is Ops.REDUCE: return self
     s = self
     while len(s.src) and s.op not in {Ops.BUFFER, Ops.PARAM, Ops.STAGE, Ops.MSTACK}: s = s.src[0]
     return s

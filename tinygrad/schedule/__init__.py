@@ -8,7 +8,11 @@ from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SC
 
 # unwrap VIEW/CAST/etc to find the actual data source (kernel output, buffer, or multi-device op)
 def _unwrap_src(s: UOp) -> UOp:
-  while len(s.src) and s.op not in {Ops.AFTER, Ops.BUFFER, Ops.PARAM, Ops.MSELECT, Ops.MSTACK, Ops.BIND}: s = s.src[0]
+  # Include REDUCE in the stop set: a REDUCE node's output lives in a
+  # separate BUFFER (wrapped in AFTER/STAGE), not in the input chain
+  # below it. Stopping here lets the caller (create_schedule) walk the
+  # parent AFTER/STAGE wrapper to find the output buffer.
+  while len(s.src) and s.op not in {Ops.AFTER, Ops.BUFFER, Ops.PARAM, Ops.MSELECT, Ops.MSTACK, Ops.BIND, Ops.REDUCE}: s = s.src[0]
   return s
 
 def _split_after(after: UOp) -> tuple[tuple[UOp, ...], tuple[UOp, ...]]:
