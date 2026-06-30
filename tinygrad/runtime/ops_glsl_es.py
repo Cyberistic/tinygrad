@@ -50,7 +50,8 @@ class _NativeFFI:
       self.lib = None
     if self.lib is None: return
     try:
-      if self.lib.android_gles_init() == 0:
+      # init returns 1 on success, 0 on failure (matches gpu_ops::init()).
+      if self.lib.android_gles_init() != 0:
         self.is_native = bool(self.lib.android_gles_is_available())
         if self.is_native:
           self.renderer_str = ctypes.string_at(self.lib.android_gles_renderer()).decode()
@@ -180,7 +181,14 @@ class GLSLESProgram:
     handles = [b[0] if isinstance(b, tuple) else b for b in bufs]
     gx, gy, gz = global_size
     if not _FFI.dispatch_jit(self.src, handles, gx, gy, gz):
-      raise RuntimeError(f"JIT dispatch failed for {self.name}: {_FFI.pop_error()}")
+      err = _FFI.pop_error()
+      # Dump the failing source for debugging
+      try:
+        with open("/data/user/0/flwr.tinygrad_client/files/failing_shader.glsl", "w") as f:
+          f.write(f"// {self.name} {global_size}\n// Error: {err}\n\n")
+          f.write(self.src)
+      except Exception: pass
+      raise RuntimeError(f"JIT dispatch failed for {self.name}: {err}")
     if wait: return _FFI.last_kernel_time_ns() * 1e-9
     return None
 

@@ -36,7 +36,31 @@ def _glsl_es_float_const(x):
   if math.isnan(x.arg):      return "(0.0/0.0)"
   return None  # let the generic pattern fire
 
+def _render_glsl_es_store(ctx, bidx, var) -> str:
+  # Find the underlying BUFFER UOp and its declared scalar type.
+  if bidx.op is Ops.INDEX and len(bidx.src) >= 1 and bidx.src[0].op is Ops.BUFFER:
+    buf = bidx.src[0]
+  elif bidx.op is Ops.BUFFER:
+    buf = bidx
+  else:
+    return f"{ctx.render_access(bidx)} = {ctx[var]};"
+  rendered = ctx._render_dtype(buf.dtype, 1, buf.arg.addrspace)
+  # If var's rendered type differs from the buffer's declared type, cast.
+  var_rendered = ctx._render_dtype(var.dtype, 1, buf.arg.addrspace)
+  if rendered != var_rendered:
+    return f"{ctx.render_access(bidx)} = {rendered}({ctx[var]});"
+  return f"{ctx.render_access(bidx)} = {ctx[var]};"
+
+
 glsl_es_matcher = PatternMatcher([
+  # STORE: wrap values in an explicit cast when the value's rendered type
+  # differs from the buffer's declared scalar type. Our _render_dtype
+  # override forces LOCAL/shared memory to float regardless of the BUFFER's
+  # UOp dtype, so writing an int to a shared float buf without a cast fails
+  # ANGLE's strict type check. cstyle's STORE pattern produces `buf = val;`
+  # without any cast; we override it here to insert the cast when needed.
+  (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("var")), name="st"),
+   lambda ctx,bidx,var,st: _render_glsl_es_store(ctx, bidx, var)),
   # Buffer declarations. LOCAL buffers get `shared` (workgroup memory) and
   # are extracted from the kernel body by render_kernel. REG buffers are
   # per-thread register accumulators (col2im scratch, im2col scratch, etc.)
@@ -45,8 +69,8 @@ glsl_es_matcher = PatternMatcher([
   # at file scope with the correct binding numbers. Emitting them here
   # would put duplicate SSBO layouts inside main().
   (UPat(Ops.BUFFER, name="x"), lambda ctx,x:
-   (f"shared float {ctx[x]}[{x.src[0].as_shape[0]}];" if x.addrspace == AddrSpace.LOCAL
-    else f"float {ctx[x]}[{x.src[0].as_shape[0]}];" if x.addrspace == AddrSpace.REG
+   (f"shared {ctx._render_dtype(x.dtype, 1, x.addrspace)} {ctx[x]}[{x.src[0].as_shape[0]}];" if x.addrspace == AddrSpace.LOCAL
+    else f"{ctx._render_dtype(x.dtype, 1, x.addrspace)} {ctx[x]}[{x.src[0].as_shape[0]}];" if x.addrspace == AddrSpace.REG
     else f"// GLOBAL buffer {ctx[x]} handled by render_kernel")),
   # Whole-buffer reference: LOAD with no index into a BUFFER.
   # The cstyle.py codegen generates `*((vecN*)(buf))` which assumes the
@@ -104,7 +128,7 @@ glsl_es_matcher = PatternMatcher([
                        if x.dtype.count > 1 else f"{ctx[b]}[0]")
    if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]})"),
   # load
-  (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"({ctx[bidx]})"),
+  (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"{ctx[bidx]}"),
   # Gated load (bounds-checked): use a multiply by the gate, which is
   # type-agnostic in GLSL ES. The codegen always uses 0.0f as the
   # default `var` for bounds-checked loads, so `gate ? bidx : 0.0f`
