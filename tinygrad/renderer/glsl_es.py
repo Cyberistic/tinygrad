@@ -395,8 +395,11 @@ class GLSLESRenderer(CStyleLanguage):
     #    sometimes emits an int constant as the LHS of a float division
     #    (e.g. `1/val4[0]` for a reciprocal). Promote the LHS to a float
     #    when it is a single integer literal. We match the patterns we
-    #    see in practice: `(N/val`, `(N/cast`, `(N/buf`.
-    pat = re.compile(r"\((\d+)f?/(val|cast|buf)")
+    #    see in practice: `(N/val`, `(N/cast`, `(N/buf`, AND `(N/(<expr>)`
+    #    (the reciprocal path `1/(exp(...)+exp(...))` used by softmax).
+    #    Without the `(N/` pattern, GLSL ES compilers reject the kernel
+    #    with `wrong operand types - no operation '/' exists`.
+    pat = re.compile(r"\((\d+)f?/(val|cast|buf|\()")
     kernel = [pat.sub(r"(\1.0f/\2", line) for line in kernel]
     local_size = [u.src[0].ssimplify() for u in sorted(
         [u for u in uops if u.op is Ops.SPECIAL and u.arg[0] == 'l'],
