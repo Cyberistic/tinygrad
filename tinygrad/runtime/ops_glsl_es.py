@@ -39,6 +39,17 @@ class _NativeFFI:
     self.renderer_str: str = ""
     self._bind()
 
+  def _ensure_bound(self) -> None:
+    """Retry the native lib load if it failed at import time. This handles
+    Chaquopy use cases where the lib is staged to the app files dir AFTER
+    the Python runtime has already imported tinygrad (so FLOWER_TINYGRAD_LIB
+    was not yet set when __init__ ran). The first FFI call re-attempts the
+    load with the current environment."""
+    if self.lib is not None and self.is_native: return
+    self.lib = None
+    self.is_native = False
+    self._bind()
+
   def _bind(self) -> None:
     candidates: list[str] = []
     if (p := os.environ.get("ANDROID_GLES_NATIVE_LIB") or os.environ.get("FLOWER_TINYGRAD_LIB")): candidates.append(p)
@@ -58,27 +69,32 @@ class _NativeFFI:
     except Exception: self.is_native = False
 
   def _configure(self) -> bool:
+    # Set argtypes/restypes for each symbol that exists. Symbols that are
+    # missing (older libflower_tinygrad.so versions that lack the newer
+    # android_gles_last_kernel_time_ns / android_gles_pop_error exports)
+    # are skipped so the device still works on older libs.
     lib = self.lib
-    try:
-      lib.android_gles_init.restype, lib.android_gles_init.argtypes = ctypes.c_int, []
-      lib.android_gles_shutdown.restype, lib.android_gles_shutdown.argtypes = None, []
-      lib.android_gles_is_available.restype, lib.android_gles_is_available.argtypes = ctypes.c_int, []
-      lib.android_gles_renderer.restype, lib.android_gles_renderer.argtypes = ctypes.c_char_p, []
-      lib.android_gles_buffer_create.restype = ctypes.c_uint32
-      lib.android_gles_buffer_create.argtypes = [ctypes.c_size_t]
-      lib.android_gles_buffer_free.restype, lib.android_gles_buffer_free.argtypes = None, [ctypes.c_uint32]
-      lib.android_gles_buffer_upload.restype = ctypes.c_int
-      lib.android_gles_buffer_upload.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]
-      lib.android_gles_buffer_download.restype = ctypes.c_int
-      lib.android_gles_buffer_download.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]
-      lib.dispatch_jit_kernel.restype, lib.dispatch_jit_kernel.argtypes = ctypes.c_bool, [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32),
-                                                                                          ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-                                                                                          ctypes.c_int, ctypes.c_int, ctypes.c_int]
-      lib.android_gles_last_kernel_time_ns.restype = ctypes.c_int64
-      lib.android_gles_last_kernel_time_ns.argtypes = []
-      lib.android_gles_pop_error.restype = ctypes.c_char_p
-      lib.android_gles_pop_error.argtypes = []
-    except AttributeError: return False
+    for name, restype, argtypes in [
+      ("android_gles_init", ctypes.c_int, []),
+      ("android_gles_shutdown", None, []),
+      ("android_gles_is_available", ctypes.c_int, []),
+      ("android_gles_renderer", ctypes.c_char_p, []),
+      ("android_gles_buffer_create", ctypes.c_uint32, [ctypes.c_size_t]),
+      ("android_gles_buffer_free", None, [ctypes.c_uint32]),
+      ("android_gles_buffer_upload", ctypes.c_int, [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]),
+      ("android_gles_buffer_download", ctypes.c_int, [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]),
+      ("dispatch_jit_kernel", ctypes.c_bool, [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32),
+                                              ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                              ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+      ("android_gles_last_kernel_time_ns", ctypes.c_int64, []),
+      ("android_gles_pop_error", ctypes.c_char_p, []),
+    ]:
+      try:
+        fn = getattr(lib, name)
+      except AttributeError:
+        continue
+      fn.restype = restype
+      fn.argtypes = argtypes
     return True
 
   def shutdown(self) -> None:
@@ -88,6 +104,7 @@ class _NativeFFI:
     self.is_native, self.renderer_str = False, ""
 
   def create_buffer(self, bytes_n: int) -> int:
+    self._ensure_bound()
     if not self.is_native: return 0
     return int(self.lib.android_gles_buffer_create(ctypes.c_size_t(bytes_n)))
 
@@ -97,27 +114,32 @@ class _NativeFFI:
     except Exception: pass
 
   def upload(self, handle: int, host: memoryview | np.ndarray) -> int:
+    self._ensure_bound()
     if not self.is_native or handle == 0: return 0
     if isinstance(host, np.ndarray): ptr = _np_as_ptr(host)
     else: ptr = _mv_as_ptr(host)
     return int(self.lib.android_gles_buffer_upload(ctypes.c_uint32(handle), ptr, ctypes.c_size_t(len(host))))
 
   def download(self, handle: int, host: np.ndarray) -> int:
+    self._ensure_bound()
     if not self.is_native or handle == 0:
       host[:] = 0
       return 0
     return int(self.lib.android_gles_buffer_download(ctypes.c_uint32(handle), _np_as_ptr(host), ctypes.c_size_t(host.nbytes)))
 
   def dispatch_jit(self, src: str, buf_handles: list[int], gx: int, gy: int, gz: int) -> bool:
+    self._ensure_bound()
     if not self.is_native: return False
     n = len(buf_handles)
     handles = (ctypes.c_uint32 * n)(*buf_handles) if n else None
     bindings = (ctypes.c_int * n)(*(range(n))) if n else None
     return bool(self.lib.dispatch_jit_kernel(src.encode(), handles, bindings, n, gx, gy, gz))
   def last_kernel_time_ns(self) -> int:
+    self._ensure_bound()
     if not self.is_native: return 0
     return int(self.lib.android_gles_last_kernel_time_ns())
   def pop_error(self) -> str:
+    self._ensure_bound()
     if not self.is_native: return ""
     try: return bytes(self.lib.android_gles_pop_error()).decode()
     except Exception: return ""
@@ -194,14 +216,26 @@ class GLSLESProgram:
 
 class GLSL_ESDevice(Compiled):
   def __init__(self, device:str) -> None:
-    self.renderer_string = _FFI.renderer_str
-    self.native = _FFI.is_native
+    self._renderer_string = _FFI.renderer_str
     from tinygrad.runtime.graph.glsl_es import GLSLESGraph
     super().__init__(device, GLSLESAllocator(self), [GLSLESRenderer],
                      functools.partial(GLSLESProgram, self), graph=GLSLESGraph, arch="")
+  @property
+  def renderer_string(self) -> str:
+    _FFI._ensure_bound()
+    return _FFI.renderer_str
+  @property
+  def native(self) -> bool:
+    # Probe FFI lazily so the value reflects rebinds that happened after
+    # this device was constructed (e.g. env var set after tinygrad import).
+    _FFI._ensure_bound()
+    return _FFI.is_native
   def synchronize(self) -> None:
+    _FFI._ensure_bound()
     if not _FFI.is_native: return
     if (err := _FFI.pop_error()): raise RuntimeError(f"GLES error: {err}")
   def finalize(self) -> None: _FFI.shutdown()
   def supports_mem_planner(self) -> bool: return False
-  def pop_error(self) -> str: return _FFI.pop_error()
+  def pop_error(self) -> str:
+    _FFI._ensure_bound()
+    return _FFI.pop_error()
