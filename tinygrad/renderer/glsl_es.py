@@ -620,9 +620,37 @@ class GLSLESRenderer(CStyleLanguage):
         if rhs != m.group(0).split('=', 1)[1].strip().rstrip(';'):
           return f"  float {var_name} = {rhs};"
       return line
+    # Fix gated-load multiply into non-float LHS for ANGLE strict GLSL ES 3.1.
+    # The codegen emits `(gate?1.0f:0.0f)*buf[idx]` for bounds-checked loads
+    # (and similar mask-multiply patterns). When the LHS is a non-float type
+    # (uint, int, uchar, ...), the result of the multiply is float (because
+    # `(gate?1.0f:0.0f)` is float) and ANGLE strict rejects the assignment
+    # with `cannot convert from 'float' to 'highp uint'`. The original
+    # multiply trick only worked when bidx and var were both float.
+    # Fix: rewrite `?1.0f:0.0f` to a typed literal pair matching the
+    # assignment LHS so the multiply stays in the LHS's dtype. For uint
+    # (the common case for gradient accumulation), `?1u:0u` makes the
+    # multiply `uint * uint = uint`. For int/short/char, `?1:0` keeps
+    # the multiply int; the LHS's declared type drives any narrowing.
+    _mask_ternary = "?1.0f:0.0f"
+    _non_float_lhs_re = re.compile(r'^(\s*)((?:uint|int|short|ushort|char|uchar)\s+\w+\s*=\s*)(.+?)(;?)\s*$')
+    _LITERAL_FOR_TYPE = {"uint": "1u:0u", "int": "1:0", "short": "1:0",
+                            "ushort": "1u:0u", "char": "1:0", "uchar": "1u:0u"}
+    _mask_sub_re = re.compile(r"\?1\.0f:0\.0f")
+    def _fix_uint_mask_mul(line: str) -> str:
+      m = _non_float_lhs_re.match(line)
+      if not m or _mask_ternary not in m.group(3): return line
+      indent, lhs, rhs, semi = m.groups()
+      target_type = lhs.split()[0]
+      lit = _LITERAL_FOR_TYPE.get(target_type, "1:0")
+      new_rhs = _mask_sub_re.sub("?" + lit, rhs)
+      if new_rhs != rhs:
+        return f"{indent}{lhs}{new_rhs}{semi}"
+      return line
     import os
     kernel = [_fix_scalar_vec4_mul(l) for l in kernel]
     kernel = [_fix_whole_buffer_ref(l) for l in kernel]
+    kernel = [_fix_uint_mask_mul(l) for l in kernel]
     # Expand vec4 stores: buf[idx] = vec4(a,b,c,d) -> 4 scalar stores.
     # With float[] SSBOs, vec4 can't be assigned to a float element.
     new_kernel = []

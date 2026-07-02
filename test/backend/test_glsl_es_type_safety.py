@@ -200,6 +200,62 @@ class TestGLSLESTypeSafety(unittest.TestCase):
         if re.search(r"\[\s*float\(", src):
             self.fail(f"Found float array index:\n{src}")
 
+    def test_uint_mask_multiply_into_uint_lhs(self):
+        """Gather of a uint source buffer must not emit
+        `(mask?1.0f:0.0f)*(uint_load)` assigned to a uint variable.
+        ANGLE strict GLES 3.1 rejects `uint = float*uint` with
+        `cannot convert from 'float' to 'highp uint'`. The renderer
+        must wrap the mask in `uint(...)` so the multiply stays in
+        uint dtype."""
+        import numpy as np
+        # MNIST-shaped uint8 buffer + randint gather reproduces the
+        # failing E_32_49_5_4_16_2_4 kernel pattern on the phone.
+        X_train = Tensor((np.random.rand(60000, 1, 28, 28) * 255).astype(np.uint8))
+        BS = 128
+        idx = Tensor.randint(BS, high=X_train.shape[0])
+        out = X_train[idx]
+        # Walk all generated kernels; any `uint X = (...)?1.0f:0.0f` line
+        # MUST have the mask wrapped in `uint(...)`. Specifically: no
+        # `uint X = (<mask>)?1.0f:0.0f` (with mask not starting `uint(`)
+        # assigned to a uint LHS.
+        bad: list[str] = []
+        for src, sink in _get_kernel_source(out):
+            for line in src.splitlines():
+                if 'uint ' not in line or '?1.0f:0.0f' not in line or '=' not in line:
+                    continue
+                # Locate the ternary and check the char immediately before
+                # `?1.0f:0.0f` (after stripping the wrapping paren).
+                idx_t = line.find('?1.0f:0.0f')
+                # Walk back to the matching `(`
+                depth, j = 0, idx_t - 1
+                while j >= 0:
+                    if line[j] == ')': depth += 1
+                    elif line[j] == '(':
+                        if depth == 0: break
+                        depth -= 1
+                    j -= 1
+                # The 4 chars before position j should be "uint" or the
+                # cast should already be present.
+                preceded_by = line[max(0, j-6):j]
+                if not preceded_by.endswith('uint') and '(uint(' not in line[max(0, j-20):idx_t]:
+                    bad.append(line.strip())
+        self.assertEqual(bad, [], f"Found unwrapped mask into uint LHS:\n  " + "\n  ".join(bad))
+
+    def test_int_mask_multiply_into_int_lhs(self):
+        """Same fix must also apply to int-typed LHS (not just uint).
+        The renderer wraps the mask in `int(...)` for int targets."""
+        # A simple int tensor with a boolean mask pattern: this hits
+        # the (cond?1.0f:0.0f)*load code path with int dtypes.
+        x = Tensor([1, 2, 3, 4, 5], dtype=dtypes.int32)
+        mask = Tensor([True, False, True, False, True])
+        out = x * mask
+        # No need to verify ANGLE compile; just ensure the renderer
+        # doesn't crash and the kernel source is well-formed.
+        for src, _ in _get_kernel_source(out):
+            # No bare `(mask?1.0f:0.0f)*int_load` should appear when
+            # the LHS is int.
+            self.assertNotRegex(src, r'(?:^|\s)int\s+\w+\s*=\s*\(?[^i][^)]*\?1\.0f:0\.0f\)')
+
 
 class TestGLSLESSourceContent(unittest.TestCase):
     """End-to-end test: the GLSL source from a complex op must compile
