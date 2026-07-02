@@ -25,6 +25,14 @@ def realize_store_after_src(ctx:dict[UOp, None], dest:UOp, src:UOp):
   # you don't usually have to do this for assign unless there's a WAR hazard like TestAssign.test_assign_double_diamond_reduce
   if dest.base in src.backward_slice_with_self: ctx[src] = None
 
+def realize_shrink_after_pad(ctx:dict[UOp, None], shr:UOp) -> None:
+  # conv2d with padding inserts a PAD; its gradient is a SHRINK back to the original spatial size.
+  # If we leave that SHRINK as a view, the fused conv_bwd_input kernel writes the padded shape
+  # (e.g. [32,32,10,10] instead of [32,32,8,8]). Force it to materialize so the producer kernel
+  # output ranges are cropped to the logical shape.
+  if shr.shape != shr.src[0].shape and any(u.op is Ops.PAD for u in shr.src[0].toposort()):
+    ctx[shr] = None
+
 pm_generate_realize_map = PatternMatcher([
   # always realize
   (UPat({Ops.COPY, Ops.CONTIGUOUS, Ops.STORE}, name="tr"), realize),
@@ -32,6 +40,8 @@ pm_generate_realize_map = PatternMatcher([
   (UPat((Ops.COPY, Ops.MSELECT, Ops.MSTACK), name="rb"), realize_srcs),
   # sometimes we need to realize the src of STORE if there's a self-access
   (UPat(Ops.STORE, src=(UPat.var("dest"), UPat.var("src"))), realize_store_after_src),
+  # NEW: realize SHRINKs that undo conv padding so the producer kernel emits the cropped shape
+  (UPat(Ops.SHRINK, name="shr"), realize_shrink_after_pad),
 ])
 
 @dataclass(frozen=True)

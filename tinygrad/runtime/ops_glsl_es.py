@@ -37,6 +37,9 @@ class _NativeFFI:
     self.lib: ctypes.CDLL | None = None
     self.is_native: bool = False
     self.renderer_str: str = ""
+    self.has_android_gles_buffer_upload_at: bool = False
+    self.has_android_gles_buffer_download_at: bool = False
+    self.has_dispatch_jit_kernel_ranges: bool = False
     self._bind()
 
   def _ensure_bound(self) -> None:
@@ -86,15 +89,32 @@ class _NativeFFI:
       ("dispatch_jit_kernel", ctypes.c_bool, [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32),
                                               ctypes.POINTER(ctypes.c_int), ctypes.c_int,
                                               ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+      # Offset-aware entry points for suballocated (view) buffers. The
+      # tinygrad memory planner packs logical tensors into shared arena
+      # buffers at 256-aligned byte offsets; these let the allocator's
+      # _offset() views transfer/bind their byte range. Older libs lack
+      # them; the callers raise if a view is used without support.
+      ("android_gles_buffer_upload_at", ctypes.c_int, [ctypes.c_uint32, ctypes.c_uint64,
+                                                       ctypes.c_void_p, ctypes.c_size_t]),
+      ("android_gles_buffer_download_at", ctypes.c_int, [ctypes.c_uint32, ctypes.c_uint64,
+                                                         ctypes.c_void_p, ctypes.c_size_t]),
+      ("dispatch_jit_kernel_ranges", ctypes.c_bool, [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint32),
+                                                     ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64),
+                                                     ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+                                                     ctypes.c_int, ctypes.c_int, ctypes.c_int]),
       ("android_gles_last_kernel_time_ns", ctypes.c_int64, []),
       ("android_gles_pop_error", ctypes.c_char_p, []),
     ]:
       try:
         fn = getattr(lib, name)
       except AttributeError:
+        if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges"):
+          setattr(self, f"has_{name}", False)
         continue
       fn.restype = restype
       fn.argtypes = argtypes
+      if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges"):
+        setattr(self, f"has_{name}", True)
     return True
 
   def shutdown(self) -> None:
@@ -113,26 +133,47 @@ class _NativeFFI:
     try: self.lib.android_gles_buffer_free(ctypes.c_uint32(handle))
     except Exception: pass
 
-  def upload(self, handle: int, host: memoryview | np.ndarray) -> int:
+  def upload(self, handle: int, host: memoryview | np.ndarray, offset: int = 0) -> int:
     self._ensure_bound()
     if not self.is_native or handle == 0: return 0
     if isinstance(host, np.ndarray): ptr = _np_as_ptr(host)
     else: ptr = _mv_as_ptr(host)
-    return int(self.lib.android_gles_buffer_upload(ctypes.c_uint32(handle), ptr, ctypes.c_size_t(len(host))))
+    nbytes = host.nbytes if isinstance(host, np.ndarray) else len(host)
+    if self.has_android_gles_buffer_upload_at:
+      # glBufferSubData path: updates the byte range in place, never
+      # reallocates the store (required for arena views, safe for all).
+      return int(self.lib.android_gles_buffer_upload_at(ctypes.c_uint32(handle), ctypes.c_uint64(offset),
+                                                        ptr, ctypes.c_size_t(nbytes)))
+    if offset != 0:
+      raise RuntimeError("view buffer upload needs android_gles_buffer_upload_at; update libflower_tinygrad.so")
+    return int(self.lib.android_gles_buffer_upload(ctypes.c_uint32(handle), ptr, ctypes.c_size_t(nbytes)))
 
-  def download(self, handle: int, host: np.ndarray) -> int:
+  def download(self, handle: int, host: np.ndarray, offset: int = 0) -> int:
     self._ensure_bound()
     if not self.is_native or handle == 0:
       host[:] = 0
       return 0
+    if self.has_android_gles_buffer_download_at:
+      return int(self.lib.android_gles_buffer_download_at(ctypes.c_uint32(handle), ctypes.c_uint64(offset),
+                                                          _np_as_ptr(host), ctypes.c_size_t(host.nbytes)))
+    if offset != 0:
+      raise RuntimeError("view buffer download needs android_gles_buffer_download_at; update libflower_tinygrad.so")
     return int(self.lib.android_gles_buffer_download(ctypes.c_uint32(handle), _np_as_ptr(host), ctypes.c_size_t(host.nbytes)))
 
-  def dispatch_jit(self, src: str, buf_handles: list[int], gx: int, gy: int, gz: int) -> bool:
+  def dispatch_jit(self, src: str, bufs: list[tuple[int, int, int]], gx: int, gy: int, gz: int) -> bool:
+    """bufs is a list of (gl_handle, byte_offset, byte_size) per SSBO binding.
+    Bindings are positional: bufs[i] -> layout(binding=i)."""
     self._ensure_bound()
     if not self.is_native: return False
-    n = len(buf_handles)
-    handles = (ctypes.c_uint32 * n)(*buf_handles) if n else None
+    n = len(bufs)
+    handles = (ctypes.c_uint32 * n)(*[b[0] for b in bufs]) if n else None
     bindings = (ctypes.c_int * n)(*(range(n))) if n else None
+    if self.has_dispatch_jit_kernel_ranges:
+      offsets = (ctypes.c_uint64 * n)(*[b[1] for b in bufs]) if n else None
+      sizes = (ctypes.c_uint64 * n)(*[b[2] for b in bufs]) if n else None
+      return bool(self.lib.dispatch_jit_kernel_ranges(src.encode(), handles, bindings, offsets, sizes, n, gx, gy, gz))
+    if any(b[1] != 0 for b in bufs):
+      raise RuntimeError("suballocated (view) buffer needs dispatch_jit_kernel_ranges; update libflower_tinygrad.so")
     return bool(self.lib.dispatch_jit_kernel(src.encode(), handles, bindings, n, gx, gy, gz))
   def last_kernel_time_ns(self) -> int:
     self._ensure_bound()
@@ -148,47 +189,55 @@ _FFI = _NativeFFI()
 
 class GLSLESAllocator(LRUAllocator['GLSL_ESDevice']):
   """Allocator backed by GLES SSBOs. Opaque buffer is a
-  `(handle:int, shadow:np.ndarray[uint8])` tuple. `shadow` is a CPU mirror
-  used for zero-copy `as_memoryview` and as the host target of downloads."""
-  def _alloc(self, size:int, options:BufferSpec) -> tuple[int, np.ndarray]:
+  `(handle:int, shadow:np.ndarray[uint8], byte_offset:int)` tuple. `shadow`
+  is a CPU mirror used for zero-copy `as_memoryview` and as the host target
+  of downloads. `byte_offset` is nonzero for suballocated views created by
+  `_offset` (tinygrad's memory planner packs logical tensors into shared
+  arena buffers): the GL handle is the arena's, and every GPU-side
+  read/write/bind must be offset by `byte_offset`. Dropping the offset
+  (the old behavior) made all views alias the arena's byte 0, silently
+  corrupting any multi-kernel graph on device."""
+  def _alloc(self, size:int, options:BufferSpec) -> tuple[int, np.ndarray, int]:
     handle = _FFI.create_buffer(size)
     shadow = np.empty(size, dtype=np.uint8)
     shadow.fill(0)
     if handle == 0 and _FFI.is_native: raise MemoryError(f"GLES OOM while allocating {size=} bytes")
-    return (handle, shadow)
-  def _free(self, opaque:tuple[int, np.ndarray], options:BufferSpec) -> None:
-    handle, _ = opaque
+    return (handle, shadow, 0)
+  def _free(self, opaque:tuple[int, np.ndarray, int], options:BufferSpec) -> None:
+    handle, _, _ = opaque
     _FFI.free_buffer(handle)
-  def _offset(self, buf:tuple[int, np.ndarray], size:int, offset:int) -> tuple[int, np.ndarray]:
-    handle, shadow = buf
-    return (handle, shadow[offset:offset+size])
-  def _as_buffer(self, src:tuple[int, np.ndarray]) -> memoryview:
+  def _offset(self, buf:tuple[int, np.ndarray, int], size:int, offset:int) -> tuple[int, np.ndarray, int]:
+    handle, shadow, base_off = buf
+    # shadow slice shares memory with the base shadow; GPU offset is
+    # carried so uploads/downloads/binds address the correct range.
+    return (handle, shadow[offset:offset+size], base_off + offset)
+  def _as_buffer(self, src:tuple[int, np.ndarray, int]) -> memoryview:
     return memoryview(src[1])
-  def _copyin(self, dest:tuple[int, np.ndarray], src:memoryview) -> None:
-    handle, shadow = dest
+  def _copyin(self, dest:tuple[int, np.ndarray, int], src:memoryview) -> None:
+    handle, shadow, off = dest
     shadow[:src.nbytes] = np.frombuffer(src, dtype=np.uint8)
-    _FFI.upload(handle, shadow[:src.nbytes])
-  def _copyout(self, dest:memoryview, src:tuple[int, np.ndarray]) -> None:
-    handle, shadow = src
-    if _FFI.is_native and handle != 0: _FFI.download(handle, shadow)
+    _FFI.upload(handle, shadow[:src.nbytes], off)
+  def _copyout(self, dest:memoryview, src:tuple[int, np.ndarray, int]) -> None:
+    handle, shadow, off = src
+    if _FFI.is_native and handle != 0: _FFI.download(handle, shadow, off)
     dest[:] = shadow[:dest.nbytes]
-  def _transfer(self, dest:tuple[int, np.ndarray], src:tuple[int, np.ndarray], sz:int,
+  def _transfer(self, dest:tuple[int, np.ndarray, int], src:tuple[int, np.ndarray, int], sz:int,
                 src_dev:'GLSL_ESDevice', dest_dev:'GLSL_ESDevice') -> None:
-    src_handle, src_shadow = src
+    src_handle, src_shadow, src_off = src
     if _FFI.is_native and src_handle != 0:
       from tinygrad.helpers import cpu_profile
       with cpu_profile(f"{src_dev.device} -> {dest_dev.device}", f"{src_dev.device}:SDMA:0"):
-        _FFI.download(src_handle, src_shadow)
+        _FFI.download(src_handle, src_shadow, src_off)
         dest_dev.synchronize()
     else:
       src_dev.synchronize()
-    _, dest_shadow = dest
+    _, dest_shadow, dest_off = dest
     dest_shadow[:sz] = src_shadow[:sz]
     if _FFI.is_native:
-      _FFI.upload(dest[0], dest_shadow[:sz])
-  def _map(self, buf:tuple[int, np.ndarray]) -> tuple[int, np.ndarray]:
+      _FFI.upload(dest[0], dest_shadow[:sz], dest_off)
+  def _map(self, buf:tuple[int, np.ndarray, int]) -> tuple[int, np.ndarray, int]:
     return buf
-  def _unmap(self, mapped_buf:tuple[int, np.ndarray]) -> None:
+  def _unmap(self, mapped_buf:tuple[int, np.ndarray, int]) -> None:
     return
 
 class GLSLESProgram:
@@ -200,9 +249,12 @@ class GLSLESProgram:
     if not _FFI.is_native:
       if wait: return 0.0
       return None
-    handles = [b[0] if isinstance(b, tuple) else b for b in bufs]
+    # (handle, byte_offset, byte_size) per positional binding. Suballocated
+    # views (memory planner arenas) carry a nonzero offset; the native side
+    # binds them with glBindBufferRange so shader index 0 maps to the view.
+    buf_infos = [(b[0], b[2], b[1].nbytes) if isinstance(b, tuple) else (b, 0, 0) for b in bufs]
     gx, gy, gz = global_size
-    if not _FFI.dispatch_jit(self.src, handles, gx, gy, gz):
+    if not _FFI.dispatch_jit(self.src, buf_infos, gx, gy, gz):
       err = _FFI.pop_error()
       # Dump the failing source for debugging
       try:
