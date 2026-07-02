@@ -461,5 +461,138 @@ class TestGLSLESSliceReadback(unittest.TestCase):
                 )
 
 
+class TestGLSLESPackedStorage(unittest.TestCase):
+    """Test that GLSL ES sub-4-byte dtypes (uchar/char/ushort/short)
+    use packed storage, matching what WGSL does.
+
+    WGSL renderer's approach (wgsl.py:12-28, 99-100):
+      - For sub-4-byte dtypes, the SSBO is declared as `uint[]` with
+        element count = byte_count / 4 (one uint per 4 source elements).
+      - Loads use read + shift + mask:
+          word = dataN[idx/4]
+          byte = (word >> (idx%4)*8) & 0xFF
+      - Stores use atomicAnd/atomicAdd (read-modify-write) or
+        `imageStore` (texture alternative):
+          old = atomic(dataN[idx/4])
+          atomic(dataN[idx/4]) = (old & ~mask) | (new & mask)
+
+    This is the WGSL-equivalent approach: no extra memory cost
+    (4x SMALLER buffer, not 4x bigger) and no std430 alignment bug.
+    The GLSL ES renderer should match this so that:
+      - uchar/char gather (fancy indexing) returns correct values
+      - uchar/char slices work
+      - The buffer size is the same as int32 (4 bytes per element)
+
+    These tests verify the GLSL ES renderer emits packed storage code
+    for sub-4-byte dtypes by inspecting the generated kernel source.
+    """
+    def setUp(self):
+        self._ctx = Context(DEV="GLSL_ES", NO_MEMORY_PLANNER=0)
+        self._ctx.__enter__()
+        _clear_program_cache()
+
+    def tearDown(self):
+        self._ctx.__exit__(None, None, None)
+
+    def _collect_kernels(self, op):
+        """Trigger compilation of `op` and return the unique kernel
+        sources that were generated for it."""
+        import tinygrad.runtime.ops_glsl_es as gles
+        seen = []
+        orig = gles.GLSLESProgram.__init__
+        def spy(self, dev, name, lib, **kw):
+            orig(self, dev, name, lib, **kw)
+            if self.src not in seen:
+                seen.append(self.src)
+        gles.GLSLESProgram.__init__ = spy
+        try:
+            out = op.numpy() if hasattr(op, 'numpy') else op.realize()
+        finally:
+            gles.GLSLESProgram.__init__ = orig
+        return seen
+
+    def test_uchar_ssbo_size_is_4x_smaller(self):
+        """With packed storage, the SSBO for a 10-byte uchar source
+        has 2-3 uint elements (10/4 rounded up), NOT 10 uint elements.
+        Verify by inspecting the SSBO declaration in the kernel source.
+        """
+        import re
+        # Trigger an add kernel on a 10-byte uchar source so we capture
+        # the SSBO declaration in the kernel source.
+        X = Tensor(np.zeros(10, dtype=np.uint8))
+        y = X + 1
+        seen = self._collect_kernels(y)
+        ssbo_re = re.compile(r'uint\s+(data\d+_\d+)Buf\s*\{\s*uint\s+\1\s*\[\s*(\d+)\s*\]\s*;')
+        for src in seen:
+            for m in ssbo_re.finditer(src):
+                name, count = m.group(1), int(m.group(2))
+                if name.startswith("data1_"):  # input buffer
+                    # With packed storage: 10/4 = 2-3 elements.
+                    # Without packed storage: 10 elements (one uint per byte).
+                    self.assertLessEqual(
+                        count, 3,
+                        f"SSBO {name}Buf has {count} elements for 10-byte uchar; "
+                        f"expected <=3 with packed storage (10/4 rounded up), got {count}"
+                    )
+                    return
+        self.fail(f"could not find a uchar input SSBO declaration in any kernel; saw: {seen}")
+
+    def test_uchar_load_uses_packed_read_pattern(self):
+        """Verify the kernel source uses the packed read pattern for
+        uchar SSBOs. The pattern is `dataN[idx/4]` plus shift and mask,
+        instead of a direct `dataN[idx]`.
+
+        On host (codegen-only), the kernel doesn't run, so the actual
+        output is always zeros. We can't test correctness of the output;
+        we only test that the GENERATED CODE has the right pattern.
+        """
+        import re
+        # Trigger a kernel that reads a uchar buffer.
+        X = Tensor(np.zeros(10, dtype=np.uint8))
+        y = X + 1
+        seen = self._collect_kernels(y)
+        # Look for a packed read: `dataN[idx/4]` plus shift (>> 8*N) and mask (& 0xFF).
+        # With packed storage: we see `data1_10[alu0/4]` or `data1_10[(alu0/4)]`.
+        # Without packed storage: we see `data1_10[alu0]` (direct index).
+        packed_pattern = re.compile(r'data\d+_\d+\s*\[[^\]]*(?:/\s*4|/4)\s*[^\]]*\]')
+        direct_pattern = re.compile(r'data\d+_\d+\s*\[\s*alu0\s*\]')
+        for src in seen:
+            if packed_pattern.search(src):
+                # Found a packed read. Good.
+                return
+            if direct_pattern.search(src):
+                # Found a direct read on a uchar buffer. This is the bug
+                # — should be packed.
+                self.fail(
+                    f"kernel reads uchar SSBO with direct `dataN[alu0]` index; "
+                    f"expected packed `dataN[alu0/4]` with shift+mask. Kernel:\n{src}"
+                )
+        # No uchar read found in any kernel.
+        self.fail(f"no uchar read found in any kernel; saw: {seen}")
+
+    def test_int32_ssbo_size_unchanged_by_packed_storage(self):
+        """int32 (itemsize=4) is NOT packed -- packed storage only applies
+        to sub-4-byte dtypes. The SSBO size for a 10-element int32 tensor
+        must remain 10 (NOT 2-3)."""
+        import re
+        X = Tensor(np.zeros(10, dtype=np.int32))
+        y = X + 1
+        seen = self._collect_kernels(y)
+        ssbo_re = re.compile(r'uint\s+(data\d+_\d+)Buf\s*\{\s*uint\s+\1\s*\[\s*(\d+)\s*\]\s*;')
+        int32_count = None
+        for src in seen:
+            for m in ssbo_re.finditer(src):
+                name, count = m.group(1), int(m.group(2))
+                if name.startswith("data1_"):
+                    int32_count = count
+                    break
+            if int32_count is not None:
+                break
+        # int32 SSBO size must be the source element count (no packing).
+        self.assertIsNotNone(int32_count, "could not find int32 input SSBO declaration")
+        self.assertEqual(int32_count, 10,
+                         f"int32 SSBO size = {int32_count}, expected 10 (no packing for int32)")
+
+
 if __name__ == "__main__":
   unittest.main()
