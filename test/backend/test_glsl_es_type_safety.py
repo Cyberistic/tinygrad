@@ -324,5 +324,142 @@ class TestGLSLESSourceContent(unittest.TestCase):
             self.assertEqual(issues, [], f"Found type anti-patterns:\n  " + "\n  ".join(issues))
 
 
+class TestGLSLESSliceReadback(unittest.TestCase):
+    """Regression test for the "size=1 slice at offset 0 returns zeros"
+    bug in tinygrad's view path.
+
+    Background: When a uchar tensor is sliced with a single element
+    (e.g. ``X_g[0:1]``), tinygrad's ``_buffer()`` method on the slice
+    materialises a fresh buffer via ``x.contiguous().realize()``. On
+    GLSL_ES (both codegen-only on host and the real Android runtime)
+    this fresh buffer ends up with an empty shadow on the first call,
+    so reading it via ``.numpy()`` returns ``[0]``. On the second call
+    the contig is recognised as a no-op (because the underlying COPY
+    is already realised) and the view path returns the correct data
+    from the source buffer.
+
+    The test walks every size-1 slice at multiple offsets on a
+    GLSL_ES-resident uchar buffer (host codegen-only mode) and asserts
+    that the *first* read returns the correct value, not 0. This
+    matches METAL/CPU behaviour. The bug breaks MNIST-style pipelines
+    where the first pixel of an image is read with a size-1 slice.
+    """
+
+    def setUp(self):
+        # Force GLSL_ES context for every test. NO_MEMORY_PLANNER=0 to
+        # exercise the suballocated arena path too.
+        self._ctx = Context(DEV="GLSL_ES", NO_MEMORY_PLANNER=0)
+        self._ctx.__enter__()
+        _clear_program_cache()
+
+    def tearDown(self):
+        self._ctx.__exit__(None, None, None)
+
+    def test_size1_slice_at_various_offsets_returns_correct_data_on_first_read(self):
+        """``X_g[off:off+1]`` for off in {0, 1, 2, 3, 4, 5, 9, 99} must
+        return the correct value on the FIRST call to .numpy()."""
+        # Use a real on-disk tensor (matches the MNIST path) so the
+        # DISK->GLSL_ES copy is exercised the same way as the on-device
+        # training probe.
+        X = Tensor.from_url('https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz', gunzip=True)
+        X_g = X[8:].to('GLSL_ES')
+
+        # First, sanity-check the source data is on the device (this
+        # also forces the COPY to run before we start slicing).
+        full = X_g.numpy()
+        # First 10 labels (we know the values from the file).
+        expected_10 = [7, 2, 1, 0, 4, 1, 4, 9, 5, 9]
+        self.assertEqual(list(full[:10]), expected_10)
+
+        # For the size-1 slice check we use a small synthetic buffer
+        # of known values so every offset is well-defined.
+        small = Tensor(np.array(expected_10, dtype=np.uint8))
+        small_g = small.to('GLSL_ES')
+        self.assertEqual(list(small_g.numpy()), expected_10)
+
+        for offset in (0, 1, 2, 3, 4, 5, 9, 99):
+            # The small buffer is only 10 elements; for offset 99 the
+            # slice runs off the end and we expect an empty result.
+            if offset < 10:
+                expected_val = expected_10[offset]
+            else:
+                expected_val = None
+            with self.subTest(offset=offset):
+                first_read = small_g[offset:offset + 1].numpy()
+                if expected_val is None:
+                    self.assertEqual(list(first_read), [],
+                                     f"X_g[{offset}:{offset + 1}] off the end should be empty")
+                else:
+                    self.assertEqual(
+                        list(first_read), [expected_val],
+                        f"X_g[{offset}:{offset + 1}].numpy() returned {list(first_read)}, "
+                        f"expected [{expected_val}] (GLSL ES size-1 slice first-read bug)"
+                    )
+
+    def test_size1_slice_int32_dtype(self):
+        """Same bug surfaced with int32 data: the LSB of the underlying
+        uint SSBO is always byte 0, so a size-1 slice at offset 0
+        returns the LSB of the uninitialised first uint (0), not the
+        first int value."""
+        X = Tensor(np.array([7, 2, 1, 0, 4, 1, 4, 9, 5, 9, 0, 6, 9, 0, 1, 5], dtype=np.int32))
+        X_g = X.to('GLSL_ES')
+        # Force the COPY to run.
+        self.assertEqual(list(X_g.numpy()[:4]), [7, 2, 1, 0])
+        for offset in (0, 1, 2, 3, 4):
+            with self.subTest(offset=offset):
+                first_read = X_g[offset:offset + 1].numpy()
+                self.assertEqual(
+                    list(first_read), [int(X.numpy()[offset])],
+                    f"X_g[{offset}:{offset + 1}].numpy() (int32) returned {list(first_read)}, "
+                    f"expected [{int(X.numpy()[offset])}]"
+                )
+
+    def test_size1_slice_float32_dtype(self):
+        """The size-1 slice bug also affects float32. METAL/CPU always
+        return the first value of the source on the first read;
+        GLSL_ES historically returns 0.0 because the view materialises
+        a fresh empty buffer on first call."""
+        X = Tensor(np.array([1.5, 2.5, 3.5, 4.5, 5.5, 6.5], dtype=np.float32))
+        X_g = X.to('GLSL_ES')
+        self.assertEqual(list(X_g.numpy()[:3]), [1.5, 2.5, 3.5])
+        for offset in (0, 1, 2, 3):
+            with self.subTest(offset=offset):
+                first_read = X_g[offset:offset + 1].numpy()
+                self.assertEqual(
+                    list(first_read), [float(X.numpy()[offset])],
+                    f"X_g[{offset}:{offset + 1}].numpy() (float32) returned {list(first_read)}, "
+                    f"expected [{float(X.numpy()[offset])}]"
+                )
+
+    def test_size5_slice_returns_correct_data(self):
+        """Sanity: multi-element slices (size >= 2) already work on
+        GLSL_ES; this test guards against regressing that path while
+        fixing the size-1 case."""
+        X = Tensor(np.array([7, 2, 1, 0, 4, 1, 4, 9, 5, 9], dtype=np.int32))
+        X_g = X.to('GLSL_ES')
+        first_read = X_g[:5].numpy()
+        self.assertEqual(list(first_read), [7, 2, 1, 0, 4])
+
+    def test_view_path_matches_cpu_behavior(self):
+        """A small uchar tensor that fits the size=1 case must read
+        the same value on GLSL_ES as on CPU/METAL on the first call.
+        Catches the regression where GLSL_ES returns 0 but other
+        backends return the correct value."""
+        for arr in (np.array([1, 2, 3, 4, 5, 100, 200, 255], dtype=np.uint8),
+                    np.array([1, 2, 3, 4, 5, 100, 200, 255], dtype=np.int32),
+                    np.array([1.5, 2.5, 3.5, 4.5, 5.5, 100.5, 200.5, 255.5], dtype=np.float32)):
+            for offset in (0, 1, 3, 5):
+                # CPU reference (always correct).
+                cpu_expected = Tensor(arr).numpy()[offset:offset + 1]
+                # GLSL_ES under test (the bug under repair).
+                gpu_first = Tensor(arr).to('GLSL_ES')[offset:offset + 1].numpy()
+                np.testing.assert_array_equal(
+                    gpu_first, cpu_expected,
+                    err_msg=f"size-1 slice at offset {offset} (dtype={arr.dtype}) "
+                            f"differs between CPU and GLSL_ES on first read: "
+                            f"CPU={cpu_expected}, GLSL_ES={gpu_first}"
+                )
+
+
 if __name__ == "__main__":
-    unittest.main()
+  unittest.main()

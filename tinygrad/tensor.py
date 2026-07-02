@@ -272,6 +272,13 @@ class Tensor(RandMixin):
     if capturing and not getenv("UNSAFE_ALLOW_JIT_BUFFER"):
       from tinygrad.engine.jit import JitError
       raise JitError("cannot access tensor data during JIT capture, the value will be baked in")
+    # First, make sure any underlying COPY (DISK->device, CPU->device, etc.)
+    # is realized so the view can resolve to a concrete BUFFER.
+    parent = self.uop
+    while parent.op in {Ops.CONTIGUOUS, Ops.SHRINK, Ops.RESHAPE, Ops.DETACH, Ops.AFTER}:
+      parent = parent.src[0]
+    if parent.op is Ops.COPY and parent.device != "CPU":
+      Tensor(parent).contiguous().realize()
     x = self.cast(self.dtype.base).contiguous()
     if self.uop.device is None or isinstance(self.device, tuple): x = x.clone("CPU")
     return cast(Buffer, x.realize().uop.buffer).ensure_allocated()
