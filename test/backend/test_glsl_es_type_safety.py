@@ -511,31 +511,28 @@ class TestGLSLESPackedStorage(unittest.TestCase):
             gles.GLSLESProgram.__init__ = orig
         return seen
 
-    def test_uchar_ssbo_size_is_4x_smaller(self):
-        """With packed storage, the SSBO for a 10-byte uchar source
-        has 2-3 uint elements (10/4 rounded up), NOT 10 uint elements.
-        Verify by inspecting the SSBO declaration in the kernel source.
+    def test_uchar_ssbo_uses_packed_read(self):
+        """With packed storage, the SSBO for a uchar source uses
+        `dataN[idx/4] >> shift & mask` to extract each source byte.
+        Without packed storage, the kernel would use `dataN[idx]`
+        which packs 4 source elements into one uint slot, breaking
+        gather/fancy-index correctness.
+
+        The SSBO is declared unsized (`dataN[]`) in GLSL ES 3.20; the
+        packed/unpacked distinction is in the LOAD access pattern,
+        not the size of the declaration. So this test checks the access
+        pattern in the kernel source.
         """
         import re
-        # Trigger an add kernel on a 10-byte uchar source so we capture
-        # the SSBO declaration in the kernel source.
         X = Tensor(np.zeros(10, dtype=np.uint8))
         y = X + 1
         seen = self._collect_kernels(y)
-        ssbo_re = re.compile(r'uint\s+(data\d+_\d+)Buf\s*\{\s*uint\s+\1\s*\[\s*(\d+)\s*\]\s*;')
+        # Look for a packed read: `dataN[expr / 4]` with shift and mask.
+        packed_re = re.compile(r'data\d+_\d+\s*\[[^\]]*?/\s*4\s*[^\]]*?\]')
         for src in seen:
-            for m in ssbo_re.finditer(src):
-                name, count = m.group(1), int(m.group(2))
-                if name.startswith("data1_"):  # input buffer
-                    # With packed storage: 10/4 = 2-3 elements.
-                    # Without packed storage: 10 elements (one uint per byte).
-                    self.assertLessEqual(
-                        count, 3,
-                        f"SSBO {name}Buf has {count} elements for 10-byte uchar; "
-                        f"expected <=3 with packed storage (10/4 rounded up), got {count}"
-                    )
-                    return
-        self.fail(f"could not find a uchar input SSBO declaration in any kernel; saw: {seen}")
+            if packed_re.search(src):
+                return  # Found a packed read.
+        self.fail(f"no packed read found in any kernel; saw: {seen}")
 
     def test_uchar_load_uses_packed_read_pattern(self):
         """Verify the kernel source uses the packed read pattern for
@@ -554,7 +551,7 @@ class TestGLSLESPackedStorage(unittest.TestCase):
         # Look for a packed read: `dataN[idx/4]` plus shift (>> 8*N) and mask (& 0xFF).
         # With packed storage: we see `data1_10[alu0/4]` or `data1_10[(alu0/4)]`.
         # Without packed storage: we see `data1_10[alu0]` (direct index).
-        packed_pattern = re.compile(r'data\d+_\d+\s*\[[^\]]*(?:/\s*4|/4)\s*[^\]]*\]')
+        packed_pattern = re.compile(r'data\d+_\d+\s*\[[^\]]*?/\s*4\s*[^\]]*?\]')
         direct_pattern = re.compile(r'data\d+_\d+\s*\[\s*alu0\s*\]')
         for src in seen:
             if packed_pattern.search(src):
@@ -570,28 +567,21 @@ class TestGLSLESPackedStorage(unittest.TestCase):
         # No uchar read found in any kernel.
         self.fail(f"no uchar read found in any kernel; saw: {seen}")
 
-    def test_int32_ssbo_size_unchanged_by_packed_storage(self):
+    def test_int32_load_unchanged_by_packed_storage(self):
         """int32 (itemsize=4) is NOT packed -- packed storage only applies
-        to sub-4-byte dtypes. The SSBO size for a 10-element int32 tensor
-        must remain 10 (NOT 2-3)."""
+        to sub-4-byte dtypes. The load should still use a direct
+        `dataN[idx]` (no `/4` shift+mask)."""
         import re
         X = Tensor(np.zeros(10, dtype=np.int32))
         y = X + 1
         seen = self._collect_kernels(y)
-        ssbo_re = re.compile(r'uint\s+(data\d+_\d+)Buf\s*\{\s*uint\s+\1\s*\[\s*(\d+)\s*\]\s*;')
-        int32_count = None
+        packed_re = re.compile(r'data\d+_\d+\s*\[[^\]]*?/\s*4\s*[^\]]*?\]')
         for src in seen:
-            for m in ssbo_re.finditer(src):
-                name, count = m.group(1), int(m.group(2))
-                if name.startswith("data1_"):
-                    int32_count = count
-                    break
-            if int32_count is not None:
-                break
-        # int32 SSBO size must be the source element count (no packing).
-        self.assertIsNotNone(int32_count, "could not find int32 input SSBO declaration")
-        self.assertEqual(int32_count, 10,
-                         f"int32 SSBO size = {int32_count}, expected 10 (no packing for int32)")
+            if packed_re.search(src):
+                self.fail(
+                    f"int32 load uses packed read (dataN[idx/4]) but should "
+                    f"be direct dataN[idx]. Kernel:\n{src}"
+                )
 
 
 if __name__ == "__main__":

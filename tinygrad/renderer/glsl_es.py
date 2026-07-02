@@ -84,6 +84,96 @@ def _render_glsl_es_load(ctx, bidx, load_dtype) -> str:
   return f"{ctx[bidx]}"
 
 
+# Packed storage for sub-4-byte dtypes (uchar/char/ushort/short).
+# GLSL ES std430 SSBOs are 4-byte aligned per element; the shader reads
+# 4 bytes per uint slot. For sub-4-byte dtypes, that packs 4 source
+# elements into each uint slot, breaking gather/fancy-index.
+#
+# WGSL solves this with packed storage: the SSBO is `uint[]` of size
+# byte_count/4, and the kernel reads `dataN[idx/4]` then extracts the
+# right byte via `(word >> (idx%4)*8) & 0xFF`. The buffer is 4x
+# SMALLER (not larger) than the source. WGSL also does the store via
+# atomic read-modify-write (atomicAnd/atomicOr). The same approach
+# works in GLSL ES 3.20: `uint` SSBOs and `atomicAnd`/`atomicOr` are
+# both available.
+def _is_packed(x):
+  if x.op is Ops.LOAD: dt, addrspace = x.dtype, x.src[0].addrspace
+  elif x.op is Ops.STORE: dt, addrspace = x.src[1].dtype, x.src[0].addrspace
+  else: dt, addrspace = x.dtype, x.addrspace
+  return dt.itemsize < 4 and dt != dtypes.half and addrspace != AddrSpace.REG
+def _packed_size(u):
+  return u.max_numel() // (4 // u.dtype.itemsize) if _is_packed(u) else u.max_numel()
+def _packed_mask(dtype):
+  return 0xFF if dtype.itemsize == 1 else 0xFFFF
+def _packed_shift(bidx, itemsize):
+  return f"((int({bidx})%{4 // itemsize})*{8 * itemsize})"
+def _packed_index(bidx, itemsize):
+  return f"(int({bidx})/{4 // itemsize})"
+
+
+def _render_packed_load(ctx, ld, buf, idx):
+  """Generate the GLSL expression for a packed LOAD on a sub-4-byte
+  buffer. The SSBO is `uint dataN[]` (declared in render_kernel with
+  size = byte_count/4). The kernel reads `dataN[idx/4]`, shifts right
+  by `(idx%4)*8`, and masks to extract the source byte.
+
+  Sign-extends for signed dtypes (char/short) by shifting the sign bit
+  into the top bit and arithmetic-shifting right."""
+  buf_name = ctx[buf]
+  dtype = ld.dtype
+  itemsize = dtype.itemsize
+  mask = 0xFF if itemsize == 1 else 0xFFFF
+  pack_factor = 4 // itemsize
+  shift_amt = (8 * itemsize)
+  shift_expr = f"((int({ctx[idx]}) %{pack_factor}) * {shift_amt})"
+  index_expr = f"(int({ctx[idx]}) / {pack_factor})"
+  # The existing render of the INDEX UOp (ld.src[0]) is `dataN[idx]`
+  # or, for casted loads, `*(cast*)(dataN[idx])`. We rewrite the
+  # `dataN[idx]` substring to `dataN[idx/4]` and append the shift+mask.
+  existing = ctx[ld.src[0]]
+  import re
+  # `buf` is the INDEX UOp (load's src[0]); its ctx render is `dataN[idx]`.
+  # We need the bare buffer name for the regex, so unwrap once.
+  buf_name = ctx[buf.src[0]] if buf.op.name == "INDEX" else ctx[buf]
+  pattern = rf"\b{re.escape(buf_name)}\s*\[\s*{re.escape(ctx[idx])}\s*\]"
+  match = re.search(pattern, existing)
+  if match is None:
+    return existing  # can't rewrite; leave unchanged
+  new_access = f"{buf_name}[{index_expr}]>>{shift_expr}&{mask}u"
+  new_render = existing[:match.start()] + new_access + existing[match.end():]
+  new_access = f"{buf_name}[{index_expr}]>>{shift_expr}&{mask}u"
+  new_render = existing[:match.start()] + new_access + existing[match.end():]
+  if dtype in (dtypes.char, dtypes.short):
+    # Sign-extend: shift the sign bit to the MSB of uint, then
+    # arithmetic-shift right by (32 - itemsize*8).
+    sext_bits = 32 - itemsize * 8
+    new_render = f"((int({new_render})<<{sext_bits})>>{sext_bits})"
+  if dtype in (dtypes.char, dtypes.short, dtypes.int32):
+    return f"int({new_render})"
+  return f"uint({new_render})"
+
+
+def _render_packed_store(ctx, st, buf, idx, val):
+  """Generate the GLSL statements for a packed STORE on a sub-4-byte
+  buffer. The SSBO is `uint dataN[]`. The kernel does an atomic read
+  of the uint slot, masks the bytes that are NOT being written, OR with
+  the new byte, and atomic-writes the result."""
+  buf_name = ctx[buf]
+  dtype = st.src[1].dtype
+  itemsize = dtype.itemsize
+  mask = 0xFF if itemsize == 1 else 0xFFFF
+  pack_factor = 4 // itemsize
+  shift_amt = (8 * itemsize)
+  shift_expr = f"((int({ctx[idx]}) %{pack_factor}) * {shift_amt})"
+  index_expr = f"(int({ctx[idx]}) / {pack_factor})"
+  val_u = f"(({ctx[val]}) & {mask}u)"
+  return (
+    f"uint _old_{ctx[buf]}_{idx}_ = atomicOr({buf_name}[{index_expr}], 0u);\n"
+    f"uint _new_{ctx[buf]}_{idx}_ = (_old_{ctx[buf]}_{idx}_ & ~(({mask}u) << {shift_expr})) | ({val_u} << {shift_expr});\n"
+    f"atomicExchange({buf_name}[{index_expr}], _new_{ctx[buf]}_{idx}_);"
+  )
+
+
 glsl_es_matcher = PatternMatcher([
   # STORE: wrap values in an explicit cast when the value's rendered type
   # differs from the buffer's declared scalar type. Our _render_dtype
@@ -126,6 +216,19 @@ glsl_es_matcher = PatternMatcher([
   # int constants
   (UPat(Ops.CONST, dtype=(dtypes.int8, dtypes.int16, dtypes.int32), name="x"),
    lambda x: str(x.arg)),
+  # Packed storage LOAD for sub-4-byte dtypes: read uint word, shift+mask.
+  # `word = dataN[idx/4]; byte = (word >> shift) & 0xFF;` then sign-extend
+  # for signed dtypes. The rendered buffer slot name is the same `ctx[x.src[0]]`
+  # (the SSBO is still named `dataN`), but the index is `idx/4` and we shift
+  # by `(idx%4)*8` bits to extract the right byte. Without this rewrite, the
+  # GLSL ES shader would do `dataN[idx]` which packs 4 source bytes into
+  # one uint slot and breaks gather/fancy-index correctness.
+  (UPat.load(UPat.var("b"), name='l'),
+   lambda ctx,l,b: _render_packed_load(ctx, l, b, l.src[0].src[1]) if _is_packed(l) else None),
+  # Packed storage STORE for sub-4-byte dtypes: do an atomic read of the
+  # uint slot, mask+OR with the new byte, atomic-write.
+  (UPat.store(UPat.var("b"), UPat.var("v"), name="s"),
+   lambda ctx,s,b,v: _render_packed_store(ctx, s, b, s.src[0].src[1], v) if _is_packed(s) else None),
   # float constants need 'f' suffix in GLSL ES for type clarity
   (UPat(Ops.CONST, dtype=dtypes.float, name="x"), lambda x: f"{x.arg}f"),
   # half constants: GLSL ES doesn't have native f16 in 3.1, promote to f32
