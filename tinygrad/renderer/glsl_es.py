@@ -19,7 +19,7 @@ import math
 from tinygrad.dtype import DType, dtypes, AddrSpace
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
 from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite, extra_pm
-from tinygrad.helpers import strip_parens
+from tinygrad.helpers import strip_parens, ceildiv
 
 # GLSL ES 3.1 compute shader pattern matcher.
 # GLSL ES-specific patterns FIRST (they take precedence), then base_rewrite
@@ -46,7 +46,9 @@ def _find_buffer_uop(u: UOp) -> UOp | None:
   return u if u.op is Ops.BUFFER else None
 
 
-def _render_glsl_es_store(ctx, bidx, var) -> str:
+def _render_glsl_es_store(ctx, st, bidx, var) -> str:
+  if _is_packed(st) and bidx.op is Ops.INDEX:
+    return _render_packed_store(ctx, st, bidx, bidx.src[1], var)
   # Find the underlying BUFFER UOp and its declared scalar type.
   if bidx.op is Ops.INDEX:
     buf = _find_buffer_uop(bidx)
@@ -98,11 +100,14 @@ def _render_glsl_es_load(ctx, bidx, load_dtype) -> str:
 # both available.
 def _is_packed(x):
   if x.op is Ops.LOAD: dt, addrspace = x.dtype, x.src[0].addrspace
-  elif x.op is Ops.STORE: dt, addrspace = x.src[1].dtype, x.src[0].addrspace
+  elif x.op is Ops.STORE:
+    dt, addrspace = x.src[1].dtype, x.src[0].addrspace
+    if x.src[0].op is Ops.INDEX and (buf:=_find_buffer_uop(x.src[0])) is not None:
+      dt = buf.dtype
   else: dt, addrspace = x.dtype, x.addrspace
-  return dt.itemsize < 4 and dt != dtypes.half and addrspace != AddrSpace.REG
+  return dt.itemsize < 4 and dt not in (dtypes.half, dtypes.bool) and addrspace != AddrSpace.REG
 def _packed_size(u):
-  return u.max_numel() // (4 // u.dtype.itemsize) if _is_packed(u) else u.max_numel()
+  return ceildiv(u.max_numel(), 4 // u.dtype.itemsize) if _is_packed(u) else u.max_numel()
 def _packed_mask(dtype):
   return 0xFF if dtype.itemsize == 1 else 0xFFFF
 def _packed_shift(bidx, itemsize):
@@ -153,12 +158,25 @@ def _render_packed_load(ctx, ld, buf, idx):
   return f"uint({new_render})"
 
 
+def _render_packed_gated_load(ctx, ld, bidx, gate):
+  """Render a packed sub-4-byte LOAD with a bounds gate.
+
+  Fancy indexing lowers to LOAD(bidx, alt, gate), so the plain packed LOAD
+  rewrite above never fires for that path. Keep the existing multiply-by-gate
+  form so the later typed-literal fixups still apply uniformly.
+  """
+  if bidx.op is not Ops.INDEX: return None
+  packed = _render_packed_load(ctx, ld, bidx, bidx.src[1])
+  return f"(({ctx[gate]}?1.0f:0.0f)*({packed}))"
+
+
 def _render_packed_store(ctx, st, buf, idx, val):
   """Generate the GLSL statements for a packed STORE on a sub-4-byte
   buffer. The SSBO is `uint dataN[]`. The kernel does an atomic read
   of the uint slot, masks the bytes that are NOT being written, OR with
   the new byte, and atomic-writes the result."""
-  buf_name = ctx[buf]
+  import re
+  buf_name = ctx[buf.src[0]] if buf.op is Ops.INDEX else ctx[buf]
   dtype = st.src[1].dtype
   itemsize = dtype.itemsize
   mask = 0xFF if itemsize == 1 else 0xFFFF
@@ -166,11 +184,10 @@ def _render_packed_store(ctx, st, buf, idx, val):
   shift_amt = (8 * itemsize)
   shift_expr = f"((int({ctx[idx]}) %{pack_factor}) * {shift_amt})"
   index_expr = f"(int({ctx[idx]}) / {pack_factor})"
-  val_u = f"(({ctx[val]}) & {mask}u)"
+  val_u = f"(uint({ctx[val]}) & {mask}u)"
   return (
-    f"uint _old_{ctx[buf]}_{idx}_ = atomicOr({buf_name}[{index_expr}], 0u);\n"
-    f"uint _new_{ctx[buf]}_{idx}_ = (_old_{ctx[buf]}_{idx}_ & ~(({mask}u) << {shift_expr})) | ({val_u} << {shift_expr});\n"
-    f"atomicExchange({buf_name}[{index_expr}], _new_{ctx[buf]}_{idx}_);"
+    f"atomicAnd({buf_name}[{index_expr}], ~(({mask}u) << {shift_expr}));\n"
+    f"atomicAdd({buf_name}[{index_expr}], {val_u} << {shift_expr});"
   )
 
 
@@ -182,7 +199,7 @@ glsl_es_matcher = PatternMatcher([
   # ANGLE's strict type check. cstyle's STORE pattern produces `buf = val;`
   # without any cast; we override it here to insert the cast when needed.
   (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("var")), name="st"),
-   lambda ctx,bidx,var,st: _render_glsl_es_store(ctx, bidx, var)),
+   lambda ctx,bidx,var,st: _render_glsl_es_store(ctx, st, bidx, var)),
   # Buffer declarations. LOCAL buffers get `shared` (workgroup memory) and
   # are extracted from the kernel body by render_kernel. REG buffers are
   # per-thread register accumulators (col2im scratch, im2col scratch, etc.)
@@ -242,7 +259,12 @@ glsl_es_matcher = PatternMatcher([
    lambda ctx,x: f"floatBitsToUint({ctx[x.src[0]]})"),
   (UPat(Ops.BITCAST, dtype=dtypes.int32, src=(UPat(dtype=dtypes.float,),), name="x"),
    lambda ctx,x: f"floatBitsToInt({ctx[x.src[0]]})"),
-  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"({ctx.type_map[x.dtype]})({ctx[x.src[0]]})"),
+  # Generic bitcasts/casts for non-float bit patterns. ANGLE rejects C-style
+  # casts `(uint)(x)` / `(int)(x)` in some positions (e.g. inside a comparison
+  # used by the RNG/count kernel En2). Use GLSL constructor syntax everywhere:
+  #   uint(x), int(x), float(x)
+  # This matches render_cast() and is the portable form in GLSL ES 3.1.
+  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"{ctx.type_map[x.dtype]}({ctx[x.src[0]]})"),
   # STACK is used for vectorized loads/stores. The dtype.count may be
   # 1 (scalar) even when there are 4 srcs (a vec4 represented as 4
   # scalars). Use len(src) for the actual vector width.
@@ -267,6 +289,8 @@ glsl_es_matcher = PatternMatcher([
   # to float; reading an int LOAD from it needs int(float(buf[idx]))).
   (UPat(Ops.LOAD, src=(UPat.var('bidx'),), name="x"),
    lambda ctx,x,bidx: _render_glsl_es_load(ctx, bidx, x.dtype)),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate")), name="x"),
+   lambda ctx,x,bidx,var,gate: _render_packed_gated_load(ctx, x, bidx, gate) if _is_packed(x) else None),
   # Gated load (bounds-checked): use a multiply by the gate, which is
   # type-agnostic in GLSL ES. The codegen always uses 0.0f as the
   # default `var` for bounds-checked loads, so `gate ? bidx : 0.0f`
@@ -494,15 +518,25 @@ class GLSLESRenderer(CStyleLanguage):
     # Post-process the kernel body to fix common codegen issues that
     # would otherwise produce non-compiling GLSL ES:
     #
-    # 1. `int / float_var` -> GLSL ES has no mixed int/float `/`. Tinygrad
-    #    sometimes emits an int constant as the LHS of a float division
-    #    (e.g. `1/val4[0]` for a reciprocal). Promote the LHS to a float
-    #    when it is a single integer literal. We match the patterns we
-    #    see in practice: `(N/val`, `(N/cast`, `(N/buf`, AND `(N/(<expr>)`
-    #    (the reciprocal path `1/(exp(...)+exp(...))` used by softmax).
-    #    Without the `(N/` pattern, GLSL ES compilers reject the kernel
-    #    with `wrong operand types - no operation '/' exists`.
-    pat = re.compile(r"\((\d+)f?/(val|cast|buf|\()")
+    # 1. `int / float_expr` -> GLSL ES has no mixed int/float `/`. Tinygrad
+    #    emits integer-literal LHS divisions in many places:
+    #      - softmax reciprocal: `1/(exp(...)+exp(...))`
+    #      - batchnorm/variance terms: `32/float_expr`, `64/float_expr`, ...
+    #      - generic reductions: `N/aluX`, `N/valX`, `N/castX`, `N/bufX`
+    #    ANGLE strict mode rejects all of these with
+    #      `wrong operand types - no operation '/' exists`
+    #    unless the LHS is a float literal.
+    #
+    #    Promote ANY integer literal `N` that appears immediately after a
+    #    `(` and before a `/`, where the RHS starts with either:
+    #      - `(`  (parenthesized expression)
+    #      - an identifier (`val`, `cast`, `buf`, `alu`, `gidx`, ...)
+    #
+    #    Examples:
+    #      `(1/(exp(...)+exp(...)))`   -> `(1.0f/(exp(...)+exp(...)))`
+    #      `(32/alu3)`                 -> `(32.0f/alu3)`
+    #      `(64/(sqrt(...)+1e-6))`     -> `(64.0f/(sqrt(...)+1e-6))`
+    pat = re.compile(r"\((\d+)f?/([A-Za-z_][A-Za-z0-9_]*|\()")
     kernel = [pat.sub(r"(\1.0f/\2", line) for line in kernel]
     local_size = [u.src[0].ssimplify() for u in sorted(
         [u for u in uops if u.op is Ops.SPECIAL and u.arg[0] == 'l'],

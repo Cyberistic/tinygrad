@@ -567,6 +567,53 @@ class TestGLSLESPackedStorage(unittest.TestCase):
         # No uchar read found in any kernel.
         self.fail(f"no uchar read found in any kernel; saw: {seen}")
 
+    def test_uchar_fancy_index_load_uses_packed_read_pattern(self):
+        """Fancy indexing lowers to gated loads; those loads still need the
+        packed `dataN[idx/4]` read path instead of direct `dataN[idx]`."""
+        import re
+        X = Tensor(np.arange(16, dtype=np.uint8)).to('GLSL_ES')
+        idx = Tensor([0, 2, 4, 9, 12], device='GLSL_ES')
+        seen = self._collect_kernels(X[idx])
+        packed_pattern = re.compile(r'data\d+_16\s*\[[^\]]*?/\s*4\s*[^\]]*?\]')
+        direct_pattern = re.compile(r'data\d+_16\s*\[\s*alu\d+\s*\]')
+        for src in seen:
+            if packed_pattern.search(src):
+                return
+            if direct_pattern.search(src):
+                self.fail(
+                    f"fancy-index kernel reads uchar SSBO with direct `dataN[alu]`; "
+                    f"expected packed `dataN[alu/4]` with shift+mask. Kernel:\n{src}"
+                )
+        self.fail(f"no uchar fancy-index read found in any kernel; saw: {seen}")
+
+    def test_uchar_fancy_index_store_uses_packed_store_pattern(self):
+        """Fancy indexing output should write packed uint slots, not direct
+        `dataN[idx] = value` stores into a `uint[]` SSBO."""
+        import re
+        X = Tensor(np.arange(16, dtype=np.uint8)).to('GLSL_ES')
+        idx = Tensor([0, 2, 4, 9, 12], device='GLSL_ES')
+        seen = self._collect_kernels(X[idx])
+        packed_pattern = re.compile(r'atomic(?:And|Add|Or|Exchange)\(data\d+_5\s*\[[^\]]*?/\s*4\s*[^\]]*?\]')
+        direct_pattern = re.compile(r'data\d+_5\s*\[\s*[0-9]+\s*\]\s*=')
+        for src in seen:
+            if packed_pattern.search(src):
+                return
+            if direct_pattern.search(src):
+                self.fail(
+                    f"fancy-index kernel stores uchar output with direct `dataN[i] = value`; "
+                    f"expected packed atomic store into `dataN[i/4]`. Kernel:\n{src}"
+                )
+        self.fail(f"no uchar fancy-index store found in any kernel; saw: {seen}")
+
+    def test_bool_output_does_not_use_packed_store(self):
+        """`bool` buffers are not packed like uchar/ushort; emitting atomic
+        uint ops on `bool[]` SSBOs does not compile on GLES."""
+        X = Tensor([1.0, 2.0, 3.0], device='GLSL_ES')
+        Y = Tensor([1.0, 0.0, 3.0], device='GLSL_ES')
+        seen = self._collect_kernels(X == Y)
+        for src in seen:
+            self.assertNotIn("atomicOr(data0_3", src, msg=f"bool output used packed atomic store:\n{src}")
+
     def test_int32_load_unchanged_by_packed_storage(self):
         """int32 (itemsize=4) is NOT packed -- packed storage only applies
         to sub-4-byte dtypes. The load should still use a direct
