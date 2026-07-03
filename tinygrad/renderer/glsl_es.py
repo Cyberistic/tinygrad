@@ -86,6 +86,31 @@ def _render_glsl_es_load(ctx, bidx, load_dtype) -> str:
   return f"{ctx[bidx]}"
 
 
+def _render_glsl_es_bitcast(ctx, x) -> str:
+  src_dtype, dst_dtype = x.src[0].dtype.scalar(), x.dtype.scalar()
+  if src_dtype == dst_dtype:
+    return ctx[x.src[0]]
+  bitcasts = {
+    (dtypes.uint32, dtypes.float): "uintBitsToFloat",
+    (dtypes.int32, dtypes.float): "intBitsToFloat",
+    (dtypes.float, dtypes.uint32): "floatBitsToUint",
+    (dtypes.float, dtypes.int32): "floatBitsToInt",
+  }
+  if (src_dtype, dst_dtype) in bitcasts:
+    return f"{bitcasts[(src_dtype, dst_dtype)]}({ctx[x.src[0]]})"
+  # For int<->uint scalar bitcasts, GLSL ES constructor casts preserve bits.
+  if {src_dtype, dst_dtype} <= {dtypes.int32, dtypes.uint32}:
+    return f"{ctx.type_map[x.dtype]}({ctx[x.src[0]]})"
+  return f"{ctx.type_map[x.dtype]}({ctx[x.src[0]]})"
+
+
+def _render_glsl_es_gated_load(ctx, x, bidx, var, gate):
+  access = _render_glsl_es_load(ctx, bidx, x.dtype)
+  if x.dtype == dtypes.bool:
+    return f"({ctx[gate]}?{access}:{ctx[var]})"
+  return f"(({ctx[gate]}?1.0f:0.0f)*({access}))"
+
+
 # Packed storage for sub-4-byte dtypes (uchar/char/ushort/short).
 # GLSL ES std430 SSBOs are 4-byte aligned per element; the shader reads
 # 4 bytes per uint slot. For sub-4-byte dtypes, that packs 4 source
@@ -106,14 +131,6 @@ def _is_packed(x):
       dt = buf.dtype
   else: dt, addrspace = x.dtype, x.addrspace
   return dt.itemsize < 4 and dt not in (dtypes.half, dtypes.bool) and addrspace != AddrSpace.REG
-def _packed_size(u):
-  return ceildiv(u.max_numel(), 4 // u.dtype.itemsize) if _is_packed(u) else u.max_numel()
-def _packed_mask(dtype):
-  return 0xFF if dtype.itemsize == 1 else 0xFFFF
-def _packed_shift(bidx, itemsize):
-  return f"((int({bidx})%{4 // itemsize})*{8 * itemsize})"
-def _packed_index(bidx, itemsize):
-  return f"(int({bidx})/{4 // itemsize})"
 
 
 def _render_packed_load(ctx, ld, buf, idx):
@@ -259,12 +276,7 @@ glsl_es_matcher = PatternMatcher([
    lambda ctx,x: f"floatBitsToUint({ctx[x.src[0]]})"),
   (UPat(Ops.BITCAST, dtype=dtypes.int32, src=(UPat(dtype=dtypes.float,),), name="x"),
    lambda ctx,x: f"floatBitsToInt({ctx[x.src[0]]})"),
-  # Generic bitcasts/casts for non-float bit patterns. ANGLE rejects C-style
-  # casts `(uint)(x)` / `(int)(x)` in some positions (e.g. inside a comparison
-  # used by the RNG/count kernel En2). Use GLSL constructor syntax everywhere:
-  #   uint(x), int(x), float(x)
-  # This matches render_cast() and is the portable form in GLSL ES 3.1.
-  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"{ctx.type_map[x.dtype]}({ctx[x.src[0]]})"),
+  (UPat(Ops.BITCAST, name="x"), _render_glsl_es_bitcast),
   # STACK is used for vectorized loads/stores. The dtype.count may be
   # 1 (scalar) even when there are 4 srcs (a vec4 represented as 4
   # scalars). Use len(src) for the actual vector width.
@@ -297,8 +309,8 @@ glsl_es_matcher = PatternMatcher([
   # is equivalent to `(gate ? 1.0f : 0.0f) * bidx`. We emit the
   # multiply form to avoid the GLSL ES ternary "mismatching operand
   # types" error when bidx is vec and var is scalar.
-  (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate"))),
-   lambda ctx,bidx,var,gate: f"(({ctx[gate]}?1.0f:0.0f)*({ctx.render_access(bidx)}))"),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate")), name="x"),
+   _render_glsl_es_gated_load),
   # WHERE (ternary) with mismatched arm types. GLSL ES 3.1's `?:` requires
   # both arms to have the same type. The codegen can produce WHEREs where
   # one arm is a vector (e.g. vec4) and the other is a scalar (float)
@@ -409,6 +421,7 @@ class GLSLESRenderer(CStyleLanguage):
   # C-style casting (float)(x) which is valid in GLSL. Ternary is valid.
   code_for_op = {**CStyleLanguage.code_for_op,
     Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})",  # GLSL ternary
+    Ops.NEG: lambda x,dtype: (f"(!{x})" if dtype == dtypes.bool else f"-{x}"),
     # GLSL ES 3.1 forbids bitwise & | ^ on bool. Use short-circuit && and ||.
     # These are correct for the only ops we ever emit on bools (mask AND/OR
     # of zero/non-zero predicates, see devectorized WHERE expansions).
@@ -416,6 +429,9 @@ class GLSLESRenderer(CStyleLanguage):
                               else f"({a}&{b})"),
     Ops.OR:  lambda a,b,dtype: ("(" + a + ") || (" + b + ")" if dtype == dtypes.bool
                               else f"({a}|{b})"),
+    Ops.XOR: lambda a,b,dtype: ("(" + a + ") != (" + b + ")" if dtype == dtypes.bool
+                              else f"({a}^{b})"),
+    Ops.CMPLT: lambda a,b,dtype: (f"(!(bool({a})) && bool({b}))" if dtype == dtypes.bool else f"({a}<{b})"),
   }
 
   # GLSL ES type names
@@ -554,14 +570,13 @@ class GLSLESRenderer(CStyleLanguage):
     # The global dispatch dims remain 3D so gidx2 (gl_WorkGroupID.z) still
     # works. This is a renderer-level fix that only affects the GLSLESRenderer.
     orig_lx = local_size[0]
-    orig_ly = local_size[1]
     orig_lz = local_size[2]
     flatten_local_z = orig_lz > 1
     if flatten_local_z:
       local_size[0] = orig_lx * orig_lz
       local_size[2] = 1
     else:
-      orig_lx = orig_ly = orig_lz = None
+      orig_lx = orig_lz = None
 
     # Detect vector width for each buffer. After linearization, BUFFER
     # UOps become PARAM UOps. The PARAM's arg is a ParamArg object with
@@ -784,7 +799,6 @@ class GLSLESRenderer(CStyleLanguage):
       if new_rhs != rhs:
         return f"{indent}{lhs}{new_rhs}{semi}"
       return line
-    import os
     kernel = [_fix_scalar_vec4_mul(l) for l in kernel]
     kernel = [_fix_whole_buffer_ref(l) for l in kernel]
     kernel = [_fix_uint_mask_mul(l) for l in kernel]

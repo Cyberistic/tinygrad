@@ -256,6 +256,37 @@ class TestGLSLESTypeSafety(unittest.TestCase):
             # the LHS is int.
             self.assertNotRegex(src, r'(?:^|\s)int\s+\w+\s*=\s*\(?[^i][^)]*\?1\.0f:0\.0f\)')
 
+    def test_add_max_uchar_kernel_has_no_type_antipatterns(self):
+        """Adapted from generic compile-failure coverage: uchar add followed by
+        a reduction should still render and keep packed uchar accesses."""
+        x = Tensor(np.arange(64, dtype=np.uint8)).to('GLSL_ES')
+        out = (x + 1).max()
+        for src, _ in _get_kernel_source(out):
+            self.assertIn("/ 4", src, f"expected packed uchar access in kernel:\n{src}")
+            self.assertNotRegex(src, r"data\d+_\d+\s*\[\s*alu\d+\s*\]",
+                                f"found direct uchar SSBO access in kernel:\n{src}")
+
+    def test_bool_ops_kernel_has_no_type_antipatterns(self):
+        """Adapted from generic bool dtype ALU coverage: bool AND/OR/XOR paths
+        should render GLSL_ES-safe source."""
+        a = Tensor([True, False, True, False], dtype=dtypes.bool)
+        b = Tensor([False, False, True, True], dtype=dtypes.bool)
+        out = (a ^ b) | (a & b)
+        for src, _ in _get_kernel_source(out):
+            issues = _find_antipatterns(src)
+            self.assertEqual(issues, [], f"Found type anti-patterns:\n  " + "\n  ".join(issues))
+            self.assertNotIn("^", src, "bool XOR should not lower to bitwise ^ in GLSL_ES")
+
+    def test_int32_midcast_float_kernel_has_no_type_antipatterns(self):
+        """Adapted from generic mid-cast ALU coverage: int32 expressions which
+        are cast through float must not emit mixed-type GLSL_ES code."""
+        x = Tensor([1, 2, 3, 4], dtype=dtypes.int32)
+        y = Tensor([5, 6, 7, 8], dtype=dtypes.int32)
+        out = (x.cast(dtypes.float) * y.cast(dtypes.float)).cast(dtypes.int32)
+        for src, _ in _get_kernel_source(out):
+            issues = _find_antipatterns(src)
+            self.assertEqual(issues, [], f"Found type anti-patterns:\n  " + "\n  ".join(issues))
+
 
 class TestGLSLESSourceContent(unittest.TestCase):
     """End-to-end test: the GLSL source from a complex op must compile

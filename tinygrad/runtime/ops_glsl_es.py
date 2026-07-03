@@ -14,11 +14,12 @@ Native API (see `app/src/main/cpp/native_api.h` + `gpu_ops_jit.h`):
   dispatch_jit_kernel(src, buf_handles, bindings, n_bufs, gx, gy, gz)
 """
 from __future__ import annotations
-import ctypes, functools, os
+import ctypes, functools, os, time
 
 import numpy as np
 
 from tinygrad.device import Compiled, LRUAllocator, BufferSpec
+from tinygrad.helpers import round_up
 from tinygrad.renderer.glsl_es import GLSLESRenderer
 
 _LIB_NAMES = ("libflower_tinygrad.so", "flower_tinygrad.so")
@@ -40,6 +41,7 @@ class _NativeFFI:
     self.has_android_gles_buffer_upload_at: bool = False
     self.has_android_gles_buffer_download_at: bool = False
     self.has_dispatch_jit_kernel_ranges: bool = False
+    self.has_android_gles_last_kernel_time_ns: bool = False
     self._bind()
 
   def _ensure_bound(self) -> None:
@@ -108,12 +110,12 @@ class _NativeFFI:
       try:
         fn = getattr(lib, name)
       except AttributeError:
-        if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges"):
+        if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges", "android_gles_last_kernel_time_ns"):
           setattr(self, f"has_{name}", False)
         continue
       fn.restype = restype
       fn.argtypes = argtypes
-      if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges"):
+      if name in ("android_gles_buffer_upload_at", "android_gles_buffer_download_at", "dispatch_jit_kernel_ranges", "android_gles_last_kernel_time_ns"):
         setattr(self, f"has_{name}", True)
     return True
 
@@ -177,7 +179,7 @@ class _NativeFFI:
     return bool(self.lib.dispatch_jit_kernel(src.encode(), handles, bindings, n, gx, gy, gz))
   def last_kernel_time_ns(self) -> int:
     self._ensure_bound()
-    if not self.is_native: return 0
+    if not self.is_native or not self.has_android_gles_last_kernel_time_ns: return 0
     return int(self.lib.android_gles_last_kernel_time_ns())
   def pop_error(self) -> str:
     self._ensure_bound()
@@ -198,10 +200,11 @@ class GLSLESAllocator(LRUAllocator['GLSL_ESDevice']):
   (the old behavior) made all views alias the arena's byte 0, silently
   corrupting any multi-kernel graph on device."""
   def _alloc(self, size:int, options:BufferSpec) -> tuple[int, np.ndarray, int]:
-    handle = _FFI.create_buffer(size)
-    shadow = np.empty(size, dtype=np.uint8)
+    alloc_size = round_up(size, 4)
+    handle = _FFI.create_buffer(alloc_size)
+    shadow = np.empty(alloc_size, dtype=np.uint8)
     shadow.fill(0)
-    if handle == 0 and _FFI.is_native: raise MemoryError(f"GLES OOM while allocating {size=} bytes")
+    if handle == 0 and _FFI.is_native: raise MemoryError(f"GLES OOM while allocating {alloc_size=} bytes")
     return (handle, shadow, 0)
   def _free(self, opaque:tuple[int, np.ndarray, int], options:BufferSpec) -> None:
     handle, _, _ = opaque
@@ -216,10 +219,20 @@ class GLSLESAllocator(LRUAllocator['GLSL_ESDevice']):
   def _copyin(self, dest:tuple[int, np.ndarray, int], src:memoryview) -> None:
     handle, shadow, off = dest
     shadow[:src.nbytes] = np.frombuffer(src, dtype=np.uint8)
-    _FFI.upload(handle, shadow[:src.nbytes], off)
+    if src.nbytes < shadow.nbytes: shadow[src.nbytes:] = 0
+    ret = _FFI.upload(handle, shadow, off)
+    if _FFI.is_native and ret == 0:
+      raise RuntimeError(_FFI.pop_error() or f"android_gles_buffer_upload failed for handle={handle}")
   def _copyout(self, dest:memoryview, src:tuple[int, np.ndarray, int]) -> None:
     handle, shadow, off = src
-    if _FFI.is_native and handle != 0: _FFI.download(handle, shadow, off)
+    if _FFI.is_native and handle != 0:
+      # JIT replay can issue multiple kernels before a scalar readback; make
+      # the device-level completion explicit so the downloaded shadow reflects
+      # the current dispatch, not the previous one.
+      self.dev.synchronize()
+      ret = _FFI.download(handle, shadow, off)
+      if ret == 0:
+        raise RuntimeError(_FFI.pop_error() or f"android_gles_buffer_download failed for handle={handle}")
     dest[:] = shadow[:dest.nbytes]
   def _transfer(self, dest:tuple[int, np.ndarray, int], src:tuple[int, np.ndarray, int], sz:int,
                 src_dev:'GLSL_ESDevice', dest_dev:'GLSL_ESDevice') -> None:
@@ -227,14 +240,18 @@ class GLSLESAllocator(LRUAllocator['GLSL_ESDevice']):
     if _FFI.is_native and src_handle != 0:
       from tinygrad.helpers import cpu_profile
       with cpu_profile(f"{src_dev.device} -> {dest_dev.device}", f"{src_dev.device}:SDMA:0"):
-        _FFI.download(src_handle, src_shadow, src_off)
+        ret = _FFI.download(src_handle, src_shadow, src_off)
+        if ret == 0:
+          raise RuntimeError(_FFI.pop_error() or f"android_gles_buffer_download failed for handle={src_handle}")
         dest_dev.synchronize()
     else:
       src_dev.synchronize()
     _, dest_shadow, dest_off = dest
     dest_shadow[:sz] = src_shadow[:sz]
     if _FFI.is_native:
-      _FFI.upload(dest[0], dest_shadow[:sz], dest_off)
+      ret = _FFI.upload(dest[0], dest_shadow[:sz], dest_off)
+      if ret == 0:
+        raise RuntimeError(_FFI.pop_error() or f"android_gles_buffer_upload failed for handle={dest[0]}")
   def _map(self, buf:tuple[int, np.ndarray, int]) -> tuple[int, np.ndarray, int]:
     return buf
   def _unmap(self, mapped_buf:tuple[int, np.ndarray, int]) -> None:
@@ -249,6 +266,7 @@ class GLSLESProgram:
     if not _FFI.is_native:
       if wait: return 0.0
       return None
+    st = time.perf_counter_ns() if wait else 0
     # (handle, byte_offset, byte_size) per positional binding. Suballocated
     # views (memory planner arenas) carry a nonzero offset; the native side
     # binds them with glBindBufferRange so shader index 0 maps to the view.
@@ -263,15 +281,17 @@ class GLSLESProgram:
           f.write(self.src)
       except Exception: pass
       raise RuntimeError(f"JIT dispatch failed for {self.name}: {err}")
-    if wait: return _FFI.last_kernel_time_ns() * 1e-9
+    if wait:
+      self.dev.synchronize()
+      if (tm:=_FFI.last_kernel_time_ns()) > 0: return tm * 1e-9
+      return max(1e-9, (time.perf_counter_ns() - st) * 1e-9)
     return None
 
 class GLSL_ESDevice(Compiled):
   def __init__(self, device:str) -> None:
     self._renderer_string = _FFI.renderer_str
-    from tinygrad.runtime.graph.glsl_es import GLSLESGraph
     super().__init__(device, GLSLESAllocator(self), [GLSLESRenderer],
-                     functools.partial(GLSLESProgram, self), graph=GLSLESGraph, arch="")
+                     functools.partial(GLSLESProgram, self), graph=None, arch="")
   @property
   def renderer_string(self) -> str:
     _FFI._ensure_bound()
